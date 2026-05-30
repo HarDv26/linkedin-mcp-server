@@ -4012,6 +4012,52 @@ class TestResolveConversationThreadUrls:
         )
         assert urls == ["https://www.linkedin.com/messaging/thread/2-aaa/"]
 
+    async def test_resolver_falls_back_to_search_when_inbox_empty(self, mock_page):
+        """When the inbox scan finds no match, resolution falls back to the
+        messaging search for threads buried below the inbox window."""
+        extractor = LinkedInExtractor(mock_page)
+        nav_mock = AsyncMock()
+        # First call (inbox) finds nothing; second call (search) finds the thread.
+        refs_mock = AsyncMock(
+            side_effect=[
+                [],
+                [
+                    {
+                        "kind": "conversation",
+                        "url": "/messaging/thread/2-ddd/",
+                        "text": "Jacki McMahan",
+                        "context": "search",
+                    },
+                ],
+            ]
+        )
+        with (
+            patch.object(extractor, "_navigate_to_page", nav_mock),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+            ),
+            patch.object(extractor, "_wait_for_main_text", new_callable=AsyncMock),
+            patch.object(
+                extractor, "_scroll_main_scrollable_region", new_callable=AsyncMock
+            ),
+            patch.object(extractor, "_extract_conversation_thread_refs", refs_mock),
+        ):
+            urls = await extractor._resolve_conversation_thread_urls("Jacki McMahan")
+
+        assert nav_mock.await_args_list[0].args == (
+            "https://www.linkedin.com/messaging/",
+        )
+        assert nav_mock.await_args_list[1].args == (
+            "https://www.linkedin.com/messaging/?searchTerm=Jacki+McMahan",
+        )
+        assert refs_mock.await_count == 2
+        assert urls == ["https://www.linkedin.com/messaging/thread/2-ddd/"]
+
     async def test_extract_refs_threads_name_filter_into_evaluate(self, mock_page):
         """_extract_conversation_thread_refs forwards name_filter into the
         in-browser click loop so non-matching rows are never clicked."""

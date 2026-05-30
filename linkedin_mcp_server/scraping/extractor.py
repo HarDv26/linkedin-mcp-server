@@ -93,12 +93,6 @@ _SORT_BY_MAP = {"date": "DD", "relevance": "R"}
 # LinkedIn accepts "F" (1st-degree), "S" (2nd-degree), "O" (3rd-degree and beyond).
 _NETWORK_TOKENS = ("F", "S", "O")
 
-# How many inbox rows to iterate when resolving a conversation by participant
-# name. Only the matching row is clicked (see _extract_conversation_thread_refs
-# name_filter), so iterating a generous count is cheap; recent threads (the
-# common get_conversation-by-username case) sit near the top of the inbox.
-_INBOX_RESOLVE_LIMIT = 50
-
 _DIALOG_SELECTOR = 'dialog[open], [role="dialog"]'
 _DIALOG_TEXTAREA_SELECTOR = '[role="dialog"] textarea, dialog textarea'
 
@@ -2268,9 +2262,23 @@ class LinkedInExtractor:
         with the same participant. Browser locale is forced to en-US so the
         verb prefix strips reliably; in any other locale the comparison fails
         cleanly with "Could not find a conversation" rather than returning
-        a wrong-thread match. Threads buried below the scrolled rows are not
-        found by name; open those via ``thread_id``.
+        a wrong-thread match. If the inbox scan finds nothing (a thread buried
+        below the scrolled rows), it falls back to the `?searchTerm=` search as
+        a last resort.
         """
+        target_name = display_name.strip().lower()
+
+        def _match(refs: list[Reference]) -> list[str]:
+            # name_filter already gated the clicks; this enforces the same
+            # exact-equality match Python-side and tolerates duplicate threads.
+            return [
+                f"https://www.linkedin.com{ref['url']}"
+                for ref in refs
+                if (ref.get("text") or "").strip().lower() == target_name
+            ]
+
+        # Primary path: enumerate the plain inbox. Reliable for the recent
+        # threads that the verify-after-send workflow needs (issue #434).
         await self._navigate_to_page("https://www.linkedin.com/messaging/")
         await detect_rate_limit(self._page)
         await self._wait_for_main_text(log_context="Messaging inbox")
@@ -2278,18 +2286,29 @@ class LinkedInExtractor:
         await self._scroll_main_scrollable_region(
             position="bottom", attempts=2, pause_time=0.5
         )
-
-        refs = await self._extract_conversation_thread_refs(
-            limit=_INBOX_RESOLVE_LIMIT, context="inbox", name_filter=display_name
+        urls = _match(
+            await self._extract_conversation_thread_refs(
+                limit=None, context="inbox", name_filter=display_name
+            )
         )
-        target_name = display_name.strip().lower()
-        urls: list[str] = []
-        for ref in refs:
-            ref_text = (ref.get("text") or "").strip().lower()
-            if not ref_text or ref_text != target_name:
-                continue
-            urls.append(f"https://www.linkedin.com{ref['url']}")
-        return urls
+        if urls:
+            return urls
+
+        # Fallback: LinkedIn's messaging search. Unreliable (often returns
+        # "We didn't find anything" even for present threads, see #434), so it
+        # runs only when the inbox scan came up empty — e.g. a thread buried
+        # below the scrolled inbox window.
+        await self._navigate_to_page(
+            f"https://www.linkedin.com/messaging/?searchTerm={quote_plus(display_name)}"
+        )
+        await detect_rate_limit(self._page)
+        await handle_modal_close(self._page)
+        await self._wait_for_main_text(log_context="Messaging search results")
+        return _match(
+            await self._extract_conversation_thread_refs(
+                limit=None, context="search", name_filter=display_name
+            )
+        )
 
     async def _open_conversation_by_username(
         self, linkedin_username: str, index: int = 0
