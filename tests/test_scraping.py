@@ -2522,6 +2522,15 @@ class TestStripConversationChrome:
             == "Maximize compose field\nis the label I keep seeing"
         )
 
+    def test_distant_companion_text_does_not_confirm_composer(self):
+        filler = "\n".join(f"message {n}" for n in range(10))
+        text = (
+            "Maximize compose field\n"
+            + filler
+            + "\nOpen send options is what I clicked"
+        )
+        assert strip_conversation_chrome(text) == text
+
     def test_quoted_composer_without_companions_does_not_truncate(self):
         text = (
             "Open the options list in your conversation with Grace Hopper and Ada Lovelace\n"

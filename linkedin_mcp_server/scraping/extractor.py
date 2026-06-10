@@ -482,6 +482,11 @@ class _MessagingChromeTable:
     composer_companions: tuple[str, ...]
 
 
+# How far below a composer-label candidate a companion control may sit and
+# still count as the same block. The observed block spans 6 lines; the slack
+# covers extra controls LinkedIn injects (e.g. "Press Enter to Send").
+_COMPOSER_COMPANION_WINDOW = 8
+
 _MESSAGING_CHROME_STRINGS: dict[str, _MessagingChromeTable] = {
     "en": _MessagingChromeTable(
         sidebar_end="Load more conversations",
@@ -516,15 +521,18 @@ def strip_conversation_chrome(text: str, locale: str = "en") -> str:
     lines = text.splitlines()
 
     # End boundary: the last composer-label line, accepted only when another
-    # composer control follows it. A message that merely quotes the label has
-    # no trailing controls and falls through to the missing-marker fallback.
+    # composer control follows within the next few lines. The real composer
+    # block is contiguous (label + controls observed within 6 lines), so a
+    # nearby companion confirms chrome, while a message that merely quotes
+    # the label — or mentions a control text much later — falls through to
+    # the missing-marker fallback.
     end = len(lines)
     for i in range(len(lines) - 1, -1, -1):
         if lines[i].strip() != table.composer_start:
             continue
         if any(
             lines[j].strip().startswith(table.composer_companions)
-            for j in range(i + 1, len(lines))
+            for j in range(i + 1, min(i + 1 + _COMPOSER_COMPANION_WINDOW, len(lines)))
         ):
             end = i
         break
