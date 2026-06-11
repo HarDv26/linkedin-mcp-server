@@ -845,13 +845,9 @@ class TestScrapePersonUrls:
 class TestDetectConnectionState:
     """Tests for locale-independent connection-state detection.
 
-    All states except incoming_request are decided purely from the
-    structural ActionSignals; profile_text is passed empty for those.
-    Incoming-request is the one AGENTS.md-sanctioned text fallback,
-    so its test passes both signals (all False) and a profile_text
-    containing Accept/Ignore labels. The two priority-ordering tests
-    intentionally pass non-empty text to verify that URL/attribute
-    signals win over text fallbacks regardless of what's in the text.
+    Every state is decided purely from the structural ActionSignals; no
+    profile text is read for any state, including incoming_request (whose
+    Accept/Ignore action row is fingerprinted by ``has_incoming_action_row``).
     """
 
     @staticmethod
@@ -861,6 +857,7 @@ class TestDetectConnectionState:
         edit: bool = False,
         labeled_action: bool = False,
         labeled_anchor: bool = False,
+        incoming_row: bool = False,
     ) -> ActionSignals:
         return ActionSignals(
             has_invite_anchor=invite,
@@ -868,20 +865,21 @@ class TestDetectConnectionState:
             has_edit_intro_anchor=edit,
             has_labeled_action_button=labeled_action,
             has_labeled_action_anchor=labeled_anchor,
+            has_incoming_action_row=incoming_row,
         )
 
     def test_self_profile(self):
-        assert detect_connection_state("", self._signals(edit=True)) == "self_profile"
+        assert detect_connection_state(self._signals(edit=True)) == "self_profile"
 
     def test_connectable(self):
-        assert detect_connection_state("", self._signals(invite=True)) == "connectable"
+        assert detect_connection_state(self._signals(invite=True)) == "connectable"
 
     def test_already_connected(self):
         # 1st-degree: Message anchor in action root, but no Follow/Connect/Pending
         # button (no aria-label on any action-root button).
         assert (
             detect_connection_state(
-                "", self._signals(compose_in_root=True, labeled_action=False)
+                self._signals(compose_in_root=True, labeled_action=False)
             )
             == "already_connected"
         )
@@ -892,7 +890,7 @@ class TestDetectConnectionState:
         # anchor.
         assert (
             detect_connection_state(
-                "", self._signals(compose_in_root=True, labeled_action=True)
+                self._signals(compose_in_root=True, labeled_action=True)
             )
             == "follow_only"
         )
@@ -902,8 +900,7 @@ class TestDetectConnectionState:
         # the action root — distinct from Follow's <button aria-label=...>.
         assert (
             detect_connection_state(
-                "",
-                self._signals(compose_in_root=True, labeled_anchor=True),
+                self._signals(compose_in_root=True, labeled_anchor=True)
             )
             == "pending"
         )
@@ -914,51 +911,54 @@ class TestDetectConnectionState:
         # fallthrough that would otherwise apply.
         assert (
             detect_connection_state(
-                "",
-                self._signals(compose_in_root=True, labeled_anchor=True),
+                self._signals(compose_in_root=True, labeled_anchor=True)
             )
             == "pending"
         )
 
-    def test_incoming_request_via_text_fallback_en(self):
-        # Locale-table fallback per AGENTS.md — Accept+Ignore (en) appear
-        # within the top-card prefix.
-        text = "Aklasur Rahman\n\n--\n\nDhaka\n\nAccept\nIgnore\nMore"
-        assert detect_connection_state(text, self._signals()) == "incoming_request"
-
-    def test_incoming_request_text_outside_top_card_ignored(self):
-        # Accept/Ignore far past the 600-char top-card budget must not match.
-        prefix = "X" * 700
-        text = prefix + "\nAccept\nIgnore\n"
-        assert detect_connection_state(text, self._signals()) == "unavailable"
-
-    def test_incoming_request_takes_priority_over_already_connected(self):
-        # If the profile somehow has both compose anchor and Accept/Ignore
-        # labels (edge case), incoming_request wins per resolution order.
-        text = "Aklasur\n\nAccept\nIgnore\nMore"
+    def test_incoming_request_via_structural_row(self):
         assert (
-            detect_connection_state(text, self._signals(compose_in_root=True))
+            detect_connection_state(self._signals(incoming_row=True))
             == "incoming_request"
         )
 
-    def test_connectable_takes_priority_over_text_signals(self):
-        # vanityName invite anchor wins even if the page also has
-        # text that would otherwise match a fallback.
-        text = "Jane\n\nAccept\nIgnore\n"
-        assert (
-            detect_connection_state(text, self._signals(invite=True)) == "connectable"
-        )
-
-    def test_unavailable_when_no_signals_or_text(self):
-        assert detect_connection_state("", self._signals()) == "unavailable"
-
-    def test_unavailable_when_compose_missing_and_no_text(self):
-        # Restricted profile: no compose anchor, no labels, no invite.
+    def test_incoming_structural_beats_pending_misclassification(self):
+        # Regression for the sidebar mis-anchor: on incoming profiles the
+        # compose-anchor action-root walk lands on sidebar cards and
+        # produces garbage signals (compose, labeled button, labeled
+        # anchor all True). The structural incoming signal must win over
+        # the pending check those garbage signals would trigger.
         assert (
             detect_connection_state(
-                "Some name\n\nFollow\n", self._signals(labeled_action=True)
+                self._signals(
+                    incoming_row=True,
+                    compose_in_root=True,
+                    labeled_action=True,
+                    labeled_anchor=True,
+                )
             )
-            == "unavailable"
+            == "incoming_request"
+        )
+
+    def test_connectable_takes_priority_over_incoming_row(self):
+        assert (
+            detect_connection_state(self._signals(invite=True, incoming_row=True))
+            == "connectable"
+        )
+
+    def test_self_profile_takes_priority_over_incoming_row(self):
+        assert (
+            detect_connection_state(self._signals(edit=True, incoming_row=True))
+            == "self_profile"
+        )
+
+    def test_unavailable_when_no_signals(self):
+        assert detect_connection_state(self._signals()) == "unavailable"
+
+    def test_unavailable_when_compose_missing(self):
+        # Restricted profile: no compose anchor, no labels, no invite.
+        assert (
+            detect_connection_state(self._signals(labeled_action=True)) == "unavailable"
         )
 
 
@@ -990,6 +990,7 @@ class TestConnectWithPerson:
         edit: bool = False,
         labeled_action: bool = False,
         labeled_anchor: bool = False,
+        incoming_row: bool = False,
     ) -> ActionSignals:
         return ActionSignals(
             has_invite_anchor=invite,
@@ -997,6 +998,7 @@ class TestConnectWithPerson:
             has_edit_intro_anchor=edit,
             has_labeled_action_button=labeled_action,
             has_labeled_action_anchor=labeled_anchor,
+            has_incoming_action_row=incoming_row,
         )
 
     async def test_connectable_navigates_deeplink_and_verifies(self, mock_page):
@@ -1489,9 +1491,10 @@ class TestConnectWithPerson:
         mock_submit.assert_not_awaited()
 
     async def test_returns_incoming_request_accepted(self, mock_page):
+        """Structural detection + structural accept click, German locale."""
         extractor = LinkedInExtractor(mock_page)
-        pre = "Aklasur\n\n--\n\nDhaka\n\nAccept\nIgnore\nMore\nAbout\n"
-        post = "Aklasur\n\n· 1st\n\nDhaka\n\nMessage\nMore\nAbout\n"
+        pre = "Eric\n\n· 2.\n\nAachen\n\nAnnehmen\nIgnorieren\nMehr\nInfo\n"
+        post = "Eric\n\n· 1.\n\nAachen\n\nNachricht\nMehr\nInfo\n"
 
         with (
             patch.object(
@@ -1503,47 +1506,161 @@ class TestConnectWithPerson:
                 extractor,
                 "_read_action_signals",
                 new_callable=AsyncMock,
-                side_effect=[self._signals(), self._signals(compose=True)],
+                side_effect=[
+                    self._signals(incoming_row=True),
+                    self._signals(compose=True),
+                ],
             ),
             patch.object(
                 extractor,
-                "click_button_by_text",
+                "_click_incoming_accept",
                 new_callable=AsyncMock,
                 return_value=True,
-            ) as mock_click,
+            ) as mock_accept,
+            patch.object(
+                extractor,
+                "_navigate_to_page",
+                new_callable=AsyncMock,
+            ) as mock_nav,
+            patch.object(
+                extractor,
+                "_submit_invite_dialog",
+                new_callable=AsyncMock,
+            ) as mock_submit,
         ):
             result = await extractor.connect_with_person("testuser")
 
         assert result["status"] == "accepted"
-        mock_click.assert_awaited_once_with("Accept", scope="main")
+        mock_accept.assert_awaited_once()
+        mock_nav.assert_not_awaited()
+        mock_submit.assert_not_awaited()
 
-    async def test_incoming_request_send_failed_when_no_first_degree(self, mock_page):
-        """Accept clicked but profile never transitions to 1st-degree."""
+    async def test_incoming_request_send_failed_when_click_fails(self, mock_page):
+        """Structural accept click did not land; no locale-text guessing —
+        report send_failed without navigating or clicking by text."""
         extractor = LinkedInExtractor(mock_page)
-        pre = "Aklasur\n\n--\n\nDhaka\n\nAccept\nIgnore\nMore\nAbout\n"
+        pre = "Eric\n\n· 2.\n\nAachen\n\nAnnehmen\nIgnorieren\nMehr\nInfo\n"
 
         with (
             patch.object(
                 extractor,
                 "scrape_person",
-                self._mock_scrape(pre, follow_up_text=pre),
+                self._mock_scrape(pre),
             ),
             patch.object(
                 extractor,
                 "_read_action_signals",
                 new_callable=AsyncMock,
-                side_effect=[self._signals(), self._signals()],
+                return_value=self._signals(incoming_row=True),
+            ),
+            patch.object(
+                extractor,
+                "_click_incoming_accept",
+                new_callable=AsyncMock,
+                return_value=False,
             ),
             patch.object(
                 extractor,
                 "click_button_by_text",
                 new_callable=AsyncMock,
                 return_value=True,
+            ) as mock_text_click,
+            patch.object(
+                extractor,
+                "_navigate_to_page",
+                new_callable=AsyncMock,
+            ) as mock_nav,
+        ):
+            result = await extractor.connect_with_person("testuser")
+
+        assert result["status"] == "send_failed"
+        mock_nav.assert_not_awaited()
+        # No text-based clicking on the destructive accept path.
+        mock_text_click.assert_not_awaited()
+
+    async def test_incoming_request_send_failed_when_no_first_degree(self, mock_page):
+        """Accept clicked but profile never transitions to 1st-degree."""
+        extractor = LinkedInExtractor(mock_page)
+        pre = "Eric\n\n· 2.\n\nAachen\n\nAnnehmen\nIgnorieren\nMehr\nInfo\n"
+
+        with (
+            patch.object(
+                extractor,
+                "scrape_person",
+                AsyncMock(
+                    return_value={
+                        "url": "https://www.linkedin.com/in/testuser/",
+                        "sections": {"main_profile": pre},
+                    }
+                ),
+            ),
+            patch.object(
+                extractor,
+                "_read_action_signals",
+                new_callable=AsyncMock,
+                return_value=self._signals(incoming_row=True),
+            ),
+            patch.object(
+                extractor,
+                "_click_incoming_accept",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
+                new_callable=AsyncMock,
             ),
         ):
             result = await extractor.connect_with_person("testuser")
 
         assert result["status"] == "send_failed"
+
+    async def test_incoming_request_accepted_on_settle_retry(self, mock_page):
+        """The first post-click read still renders the old top card;
+        the settle retry sees the 1st-degree state and reports accepted."""
+        extractor = LinkedInExtractor(mock_page)
+        pre = "Eric\n\n· 2.\n\nAachen\n\nAnnehmen\nIgnorieren\nMehr\nInfo\n"
+        post = "Eric\n\n· 1.\n\nAachen\n\nNachricht\nMehr\nInfo\n"
+        page = {
+            "url": "https://www.linkedin.com/in/testuser/",
+            "sections": {"main_profile": pre},
+        }
+        page_post = {
+            "url": "https://www.linkedin.com/in/testuser/",
+            "sections": {"main_profile": post},
+        }
+
+        with (
+            patch.object(
+                extractor,
+                "scrape_person",
+                AsyncMock(side_effect=[page, page, page_post]),
+            ),
+            patch.object(
+                extractor,
+                "_read_action_signals",
+                new_callable=AsyncMock,
+                side_effect=[
+                    self._signals(incoming_row=True),
+                    self._signals(incoming_row=True),
+                    self._signals(compose=True),
+                ],
+            ),
+            patch.object(
+                extractor,
+                "_click_incoming_accept",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
+                new_callable=AsyncMock,
+            ) as mock_sleep,
+        ):
+            result = await extractor.connect_with_person("testuser")
+
+        assert result["status"] == "accepted"
+        mock_sleep.assert_awaited_once()
 
     async def test_returns_unavailable_when_no_signals_and_text(self, mock_page):
         """No structural signals, no actionable text → connect_unavailable."""

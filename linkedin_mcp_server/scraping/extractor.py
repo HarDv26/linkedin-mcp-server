@@ -150,6 +150,74 @@ function findActionRoot(main) {
 }
 """
 
+# Shared JS function that fingerprints the incoming-request action row.
+# Incoming-request profiles render no Message button in the top card, so
+# findActionRoot (compose-anchor walk) cannot locate their action row and
+# would mis-anchor on sidebar mutual-connection cards instead. This walk
+# anchors on button[aria-expanded] (the More button) and validates the
+# smallest multi-button ancestor against the fingerprint verified live
+# 2026-06-11 on two German-locale incoming-request profiles:
+#
+#   [button aria-label (Accept)] [button aria-label (Ignore)]
+#   [button aria-expanded, no aria-label (More)]
+#
+# All checks are attribute presence and structural counts per the
+# AGENTS.md Scraping Rules — no label values are read. Every guard kills
+# a known false positive: total-button-count === 3 and labeled === 2
+# exclude video-player control bars (play/mute/captions all carry
+# aria-label); the unlabeled-expander check excludes player settings
+# expanders (the profile More button never carries aria-label); the
+# DOM-order guard excludes bars with trailing labeled buttons; the
+# compose/invite/labeled-anchor exclusions kill follow_only, pending,
+# connected top cards and sidebar cards. The scan continues over ALL
+# expander candidates because cover-video profiles render the player's
+# expander before the top-card row in DOM order.
+#
+# The search is scoped to the top card — the first <section> of <main>
+# (falling back to main's first child, then main). Profile pages render
+# the action row in the top card; feed, "people also viewed", and other
+# widgets live in later sections. Without the scope an unrelated widget
+# elsewhere in main with the same button shape could be misclassified and
+# its first labeled button clicked.
+#
+# Inlined into _ACTION_SIGNALS_JS and _CLICK_INCOMING_ACCEPT_JS so a
+# single change to the fingerprint propagates to both call sites.
+_FIND_INCOMING_ACTION_ROW_FN_JS = r"""
+function findIncomingActionRow(main) {
+  const scope = main.querySelector('section') || main.firstElementChild || main;
+  const matches = [];
+  for (const expander of scope.querySelectorAll('button[aria-expanded]')) {
+    let el = expander.parentElement;
+    while (el && el !== scope && el !== main) {
+      if (el.querySelectorAll('button').length >= 2) {
+        const buttons = el.querySelectorAll('button');
+        const labeled = el.querySelectorAll('button[aria-label]');
+        const expanders = el.querySelectorAll('button[aria-expanded]');
+        if (
+          buttons.length === 3 &&
+          labeled.length === 2 &&
+          expanders.length === 1 &&
+          !expanders[0].hasAttribute('aria-label') &&
+          expanders[0].compareDocumentPosition(labeled[1]) &
+            Node.DOCUMENT_POSITION_PRECEDING &&
+          !el.querySelector('a[href*="/messaging/compose/"]') &&
+          !el.querySelector('a[href*="/preload/custom-invite/"]') &&
+          !el.querySelector('a[aria-label]')
+        ) {
+          matches.push(el);
+        }
+        break;
+      }
+      el = el.parentElement;
+    }
+  }
+  // Require a unique match: a profile's top card has exactly one action
+  // row. Ambiguity (two rows matching the shape) is treated as no match so
+  // the irreversible Accept click never fires on a guessed control.
+  return matches.length === 1 ? matches[0] : null;
+}
+"""
+
 # Locale-independent connection-state probe. Returns four booleans;
 # per AGENTS.md Scraping Rules, every signal is based on URL patterns
 # or ARIA-attribute *presence* — never on label text values.
@@ -172,6 +240,11 @@ function findActionRoot(main) {
 #   back to the profile URL) carrying aria-label like "Pending, click to
 #   withdraw…". The Message anchor has only aria-disabled, so a labeled
 #   anchor is the locale-independent Pending signal.
+# - hasIncomingActionRow: the incoming-request fingerprint matched (see
+#   _FIND_INCOMING_ACTION_ROW_FN_JS). Computed independently of
+#   findActionRoot, which cannot locate the top-card row on incoming
+#   profiles (no compose anchor there) and would mis-anchor on sidebar
+#   cards.
 #
 # The username is CSS-escaped before interpolation into attribute
 # selectors to defend against malformed inputs containing characters
@@ -181,6 +254,7 @@ _ACTION_SIGNALS_JS = (
 ((username) => {
 """
     + _FIND_ACTION_ROOT_FN_JS
+    + _FIND_INCOMING_ACTION_ROW_FN_JS
     + r"""
   const main = document.querySelector('main');
   if (!main) return null;
@@ -220,6 +294,7 @@ _ACTION_SIGNALS_JS = (
     hasEditIntro,
     hasLabeledActionButton,
     hasLabeledActionAnchor,
+    hasIncomingActionRow: !!findIncomingActionRow(main),
   };
 })
 """
@@ -244,6 +319,28 @@ _OPEN_MORE_BUTTON_JS = (
   const moreBtn = actionRoot.querySelector('button[aria-expanded]');
   if (!moreBtn) return false;
   moreBtn.click();
+  return true;
+})
+"""
+)
+
+# Click Accept on an incoming-request profile. Accept is the FIRST labeled
+# button in the fingerprinted row — primary actions render first in
+# top-card action rows (Connect/Message lead on other profile states; the
+# inverse of dialogs, where the primary button renders last). Clicking the
+# second button would silently and irreversibly Ignore the request, so the
+# click only fires when the full fingerprint matched.
+_CLICK_INCOMING_ACCEPT_JS = (
+    r"""
+(() => {
+"""
+    + _FIND_INCOMING_ACTION_ROW_FN_JS
+    + r"""
+  const main = document.querySelector('main');
+  if (!main) return false;
+  const row = findIncomingActionRow(main);
+  if (!row) return false;
+  row.querySelectorAll('button[aria-label]')[0].click();
   return true;
 })
 """
@@ -971,6 +1068,23 @@ class LinkedInExtractor:
             logger.debug("More menu did not appear after click")
             return False
 
+    async def _click_incoming_accept(self) -> bool:
+        """Click Accept on an incoming-request profile, locale-independently.
+
+        Delegates to ``_CLICK_INCOMING_ACCEPT_JS``: the click fires only
+        when the full incoming-row fingerprint matches, and it targets the
+        FIRST labeled button (Accept renders before Ignore — primary
+        actions lead in top-card rows). Clicking the second button would
+        silently and irreversibly Ignore the request; the strict
+        fingerprint plus the caller's verify-after-click are the
+        mitigations. Returns True iff the click landed.
+        """
+        try:
+            return bool(await self._page.evaluate(_CLICK_INCOMING_ACCEPT_JS))
+        except Exception:
+            logger.debug("Incoming accept click via JS failed", exc_info=True)
+            return False
+
     async def _locator_is_visible(self, selector: str, *, timeout: int = 2000) -> bool:
         """Return whether the first matching locator is visible."""
         locator = self._page.locator(selector)
@@ -1693,6 +1807,7 @@ class LinkedInExtractor:
                 has_edit_intro_anchor=False,
                 has_labeled_action_button=False,
                 has_labeled_action_anchor=False,
+                has_incoming_action_row=False,
             )
         return ActionSignals(
             has_invite_anchor=bool(data.get("hasInvite")),
@@ -1700,6 +1815,7 @@ class LinkedInExtractor:
             has_edit_intro_anchor=bool(data.get("hasEditIntro")),
             has_labeled_action_button=bool(data.get("hasLabeledActionButton")),
             has_labeled_action_anchor=bool(data.get("hasLabeledActionAnchor")),
+            has_incoming_action_row=bool(data.get("hasIncomingActionRow")),
         )
 
     async def _submit_invite_dialog(
@@ -1909,7 +2025,7 @@ class LinkedInExtractor:
             )
 
         signals = await self._read_action_signals(username)
-        state = detect_connection_state(page_text, signals)
+        state = detect_connection_state(signals)
         logger.info(
             "Connection signals for %s: state=%s signals=%s", username, state, signals
         )
@@ -1937,11 +2053,14 @@ class LinkedInExtractor:
             )
 
         if state == "incoming_request":
-            # TODO(locale): replace text-based Accept click with a
-            # structural identifier — needs a live probe against a real
-            # incoming-request profile (we have none to test against).
-            # Tracked as a documented escape-hatch per AGENTS.md.
-            clicked = await self.click_button_by_text("Accept", scope="main")
+            # Accept clicks the first labeled button in the fingerprinted
+            # row. There is deliberately no locale-text fallback: clicking
+            # a button matched by exact text anywhere in the page risks
+            # hitting the wrong control (or the Ignore button in another
+            # locale), and accepting/ignoring is irreversible. When the
+            # fingerprint does not match we report send_failed rather than
+            # guess.
+            clicked = await self._click_incoming_accept()
             if not clicked:
                 return _connection_result(
                     url,
@@ -1949,10 +2068,21 @@ class LinkedInExtractor:
                     "Could not find or click the Accept button.",
                     profile=page_text,
                 )
-            verified = await self.scrape_person(username, {"main_profile"})
-            verified_text = verified.get("sections", {}).get("main_profile", "")
-            verified_signals = await self._read_action_signals(username)
-            verified_state = detect_connection_state(verified_text, verified_signals)
+            # LinkedIn propagates the accepted state asynchronously; an
+            # immediate re-read can still render the old top card and
+            # would report send_failed for a successful accept (observed
+            # live 2026-06-11). Verify with one settle retry.
+            verified_text = ""
+            verified_state = None
+            for attempt in range(2):
+                if attempt:
+                    await asyncio.sleep(3.0)
+                verified = await self.scrape_person(username, {"main_profile"})
+                verified_text = verified.get("sections", {}).get("main_profile", "")
+                verified_signals = await self._read_action_signals(username)
+                verified_state = detect_connection_state(verified_signals)
+                if verified_state == "already_connected":
+                    break
             if verified_state != "already_connected":
                 return _connection_result(
                     url,
@@ -2044,7 +2174,7 @@ class LinkedInExtractor:
         verified = await self.scrape_person(username, {"main_profile"})
         verified_text = verified.get("sections", {}).get("main_profile", "")
         verified_signals = await self._read_action_signals(username)
-        verified_state = detect_connection_state(verified_text, verified_signals)
+        verified_state = detect_connection_state(verified_signals)
 
         if verified_signals.has_invite_anchor:
             return _connection_result(
