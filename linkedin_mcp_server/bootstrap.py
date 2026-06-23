@@ -455,6 +455,12 @@ async def _ensure_full_chromium_installed() -> None:
     secure_mkdir(browser_dir)
     if not shell_ready():
         await _run_patchright_install("--only-shell")
+        # Record the shell before the full stage so a --no-shell failure leaves
+        # the shell marked ready and a retry skips re-installing it.
+        _write_install_metadata(
+            browser_dir,
+            {_SHELL_DIR_PREFIX: True, _FULL_DIR_PREFIX: False},
+        )
     await _run_patchright_install("--no-shell")
     _write_install_metadata(
         browser_dir,

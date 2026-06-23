@@ -685,6 +685,41 @@ class TestTwoStageInstall:
             "chromium_headless_shell-": True,
         }
 
+    async def test_ensure_full_records_shell_before_full_stage_fails(
+        self, isolate_profile_dir, monkeypatch
+    ):
+        """A --no-shell failure still leaves the shell recorded as installed."""
+        from linkedin_mcp_server.exceptions import BrowserSetupFailedError
+
+        _patch_targets_and_version(monkeypatch)
+        monkeypatch.setattr(
+            "linkedin_mcp_server.bootstrap.full_chromium_ready", lambda: False
+        )
+        monkeypatch.setattr("linkedin_mcp_server.bootstrap.shell_ready", lambda: False)
+
+        calls: list[str] = []
+
+        async def fake_install(extra_arg: str) -> None:
+            calls.append(extra_arg)
+            if extra_arg == "--no-shell":
+                raise BrowserSetupFailedError("network down")
+
+        monkeypatch.setattr(
+            "linkedin_mcp_server.bootstrap._run_patchright_install", fake_install
+        )
+
+        from linkedin_mcp_server.bootstrap import _ensure_full_chromium_installed
+
+        with pytest.raises(BrowserSetupFailedError):
+            await _ensure_full_chromium_installed()
+
+        assert calls == ["--only-shell", "--no-shell"]
+        payload = json.loads(install_metadata_path().read_text())
+        assert payload["installed_targets"] == {
+            "chromium-": False,
+            "chromium_headless_shell-": True,
+        }
+
     async def test_headed_installs_both_in_order(
         self, isolate_profile_dir, monkeypatch
     ):
