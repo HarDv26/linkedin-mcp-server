@@ -233,7 +233,8 @@ def load_from_env(config: AppConfig) -> AppConfig:
         config.server.import_from_browser = _normalize_env(import_browser_env) or "auto"
 
     # Auto-import a session from a logged-in browser on first no-session tool
-    # call. Unset = auto (on for an interactive TTY run, off otherwise).
+    # call. Unset = on by default (interactive and non-interactive desktop);
+    # false disables it. No effect under Docker or a non-loopback HTTP bind.
     if auto_import_env := os.environ.get(EnvironmentKeys.AUTO_IMPORT_FROM_BROWSER):
         auto_import_value = _normalize_env(auto_import_env)
         if auto_import_value in FALSY_VALUES:
@@ -406,8 +407,9 @@ def load_from_args(config: AppConfig) -> AppConfig:
         action="store_true",
         default=None,
         help=(
-            "Force auto-import of a session from a locally logged-in browser on "
-            "first use, even in a non-interactive (stdio) context"
+            "Auto-import a session from a locally logged-in browser on first "
+            "use (the default). Provided for explicitness; it cannot override "
+            "the Docker or non-loopback-HTTP gates."
         ),
     )
     auto_import_group.add_argument(
@@ -416,8 +418,8 @@ def load_from_args(config: AppConfig) -> AppConfig:
         action="store_false",
         default=None,
         help=(
-            "Never auto-import a session from a browser on first use; require "
-            "--login or --import-from-browser instead"
+            "Disable auto-import of a session from a browser on first use; "
+            "require --login or --import-from-browser instead."
         ),
     )
 

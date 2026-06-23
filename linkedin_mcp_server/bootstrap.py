@@ -37,7 +37,6 @@ from linkedin_mcp_server.exceptions import (
 from linkedin_mcp_server.session_state import (
     auth_root_dir,
     get_runtime_id,
-    has_local_gui_session,
     portable_cookie_path,
     profile_exists,
     runtime_profiles_root,
@@ -456,40 +455,39 @@ def _has_source_state() -> bool:
 def _auto_import_allowed() -> bool:
     """Return whether a silent browser-session import is safe to attempt now.
 
-    Locale-independent: keys off the config flag, the runtime policy, the
-    transport bind address, stdin/stdout TTYs, and the macOS Aqua launchd
-    domain token -- never any displayed UI string. The flag check MUST stay
-    first (test fakes and the tri-state 'auto' resolution depend on it).
+    Auto-import is ON BY DEFAULT. Locale-independent: keys off the config flag,
+    the runtime policy, and the transport bind address -- never any displayed
+    UI string. The flag check MUST stay first (test fakes and the tri-state
+    'auto' resolution depend on it): None (default) and True both enable it,
+    only an explicit False disables it.
+
+    The two hard limits stay: Docker (no host browser/keychain) and a
+    non-loopback streamable-http bind (a network-exposed HTTP daemon must not
+    harvest a host cookie on a remote request). Note this covers network-exposed
+    HTTP only, NOT stdio-over-SSH: a non-console session simply fails to decrypt
+    the local user's keychain and degrades to manual login, and no cookie
+    crosses the network.
     """
     config = get_config()
-    flag = config.browser.auto_import_from_browser
-    if flag is False:
+    if config.browser.auto_import_from_browser is False:
         return False
     if get_runtime_policy() == RuntimePolicy.DOCKER:
         # No host browser and no keychain inside a container.
         return False
     # A network-exposed HTTP daemon must never silently harvest a cookie on a
     # request from a remote client. Gate on the BIND ADDRESS, not the transport
-    # type: a streamable-http server on 127.0.0.1 is the documented local dev /
-    # verify flow on a GUI host and IS a desktop case; only a non-loopback bind
-    # is the service case.
+    # type: a streamable-http server on a loopback host is the documented local
+    # dev / verify flow and IS a desktop case; only a non-loopback bind is the
+    # service case. This is an exact-match loopback allowlist that fails closed:
+    # any unrecognized host (0.0.0.0, ::, a LAN IP, an IPv4-mapped loopback)
+    # is treated as non-loopback and gated OFF.
     if config.server.transport == "streamable-http" and config.server.host not in (
         "127.0.0.1",
         "::1",
         "localhost",
     ):
         return False
-    if config.is_interactive:
-        # A human ran the CLI (stdin AND stdout are TTYs); they can answer a
-        # keychain dialog. 'auto' (flag is None) and explicit True both pass.
-        return True
-    # Non-interactive (stdio Desktop child: no TTY). 'auto' stays OFF here
-    # because the one-time keychain dialog/notice never reaches the user;
-    # require an explicit opt-in (flag is True). This is the PRIMARY gate for
-    # the stdio/Desktop target.
-    if flag is not True:
-        return False
-    return has_local_gui_session()
+    return True
 
 
 def _pending_login_message(prior_error: str | None) -> str:
@@ -548,9 +546,10 @@ async def _try_auto_import_session(ctx: Context | None = None) -> bool:
     from linkedin_mcp_server.browser_import.orchestrate import (
         import_session_from_browser,
     )
-    from linkedin_mcp_server.core.exceptions import AuthenticationError
+    from linkedin_mcp_server.core.exceptions import AuthenticationError, NetworkError
     from linkedin_mcp_server.exceptions import (
         CookieDecryptionError,
+        LinkedInMCPError,
         NoLinkedInSessionFoundError,
     )
 
@@ -563,11 +562,37 @@ async def _try_auto_import_session(ctx: Context | None = None) -> bool:
     prev_headless = current_headless()
     set_headless(True)  # background probe; never pop a visible window
     try:
-        return await import_session_from_browser(None, user_data_dir=user_data_dir)
+        # Hard ceiling on the whole import. The on-loop validation step launches
+        # a persistent Chromium context (drivers/browser.py validate_imported_cookies
+        # -> core/browser.py start) with NO launch timeout, so a wedged binary
+        # (stale SingletonLock, sandbox stall, half-installed Chromium, X-less
+        # Linux desktop) would otherwise hang the first no-session tool call.
+        # Default-on routes every desktop first-call through this, so the bound
+        # is what makes "fails fast and falls back" hold end to end. Keychain
+        # reads are already bounded (security 10s / secret-tool 10s); this covers
+        # the launch + navigation budget on top.
+        result = await asyncio.wait_for(
+            import_session_from_browser(None, user_data_dir=user_data_dir),
+            timeout=60,
+        )
+        if not result:
+            # Reached only when a live li_at decrypted but LinkedIn rejected the
+            # session (orchestrate.py:254). The "no live session" and "could not
+            # decrypt" cases RAISE and are handled below.
+            logger.info(
+                "Auto-import found no usable browser session; "
+                "falling back to manual login"
+            )
+        return result
+    except TimeoutError:
+        logger.info("Auto-import timed out after 60s; falling back to manual login")
+        return False
     except (
         NoLinkedInSessionFoundError,
         CookieDecryptionError,
         AuthenticationError,
+        NetworkError,
+        LinkedInMCPError,
     ) as exc:
         logger.info("Auto-import unavailable; falling back to manual login: %s", exc)
         return False

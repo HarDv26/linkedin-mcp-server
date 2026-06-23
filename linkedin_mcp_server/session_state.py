@@ -3,14 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, fields
-import functools
 import json
 import logging
 import platform
 from pathlib import Path
 import shutil
-import subprocess
-import sys
 from typing import Any
 from uuid import uuid4
 
@@ -160,37 +157,6 @@ def _is_container_runtime() -> bool:
             return True
 
     return False
-
-
-@functools.cache
-def has_local_gui_session() -> bool:
-    """Return whether the process runs in a macOS Aqua (GUI) launchd domain.
-
-    Lets a non-TTY desktop subprocess (a Claude Desktop stdio child, which has
-    no controlling terminal but does run in the Aqua domain) qualify for a
-    silent keychain read. ``launchctl managername`` returns ``Aqua`` in a GUI
-    login session and ``Background``/``StandardIO`` over SSH or in a daemon.
-    The token is a launchd domain identifier, not localized UI text. Fails
-    closed (returns False) on any error or timeout.
-
-    Cached for the process lifetime: the launchd domain does not change during a
-    run, so the (up to 2s) ``launchctl`` probe runs at most once instead of on
-    every no-session tool call -- which matters because the caller evaluates it
-    inside the bootstrap lock.
-    """
-    if sys.platform != "darwin":
-        return False
-    try:
-        result = subprocess.run(
-            ["launchctl", "managername"],
-            capture_output=True,
-            text=True,
-            timeout=2.0,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return result.returncode == 0 and result.stdout.strip() == "Aqua"
 
 
 def _path_contains_markers(path: Path, markers: tuple[str, ...]) -> bool:

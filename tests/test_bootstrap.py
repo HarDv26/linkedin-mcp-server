@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,12 +31,14 @@ from linkedin_mcp_server.bootstrap import (
     start_background_browser_setup_if_needed,
 )
 from linkedin_mcp_server.config.schema import AppConfig
+from linkedin_mcp_server.core.exceptions import NetworkError
 from linkedin_mcp_server.exceptions import (
     AuthenticationInProgressError,
     AuthenticationStartedError,
     BrowserSetupInProgressError,
     CookieDecryptionError,
     DockerHostLoginRequiredError,
+    LinkedInMCPError,
     NoLinkedInSessionFoundError,
 )
 from linkedin_mcp_server.session_state import (
@@ -974,6 +977,8 @@ class TestAutoLogin:
         [
             AsyncMock(side_effect=NoLinkedInSessionFoundError("none")),
             AsyncMock(side_effect=CookieDecryptionError("app-bound")),
+            AsyncMock(side_effect=NetworkError("launch wedged")),
+            AsyncMock(side_effect=LinkedInMCPError("import error")),
             AsyncMock(return_value=False),
         ],
     )
@@ -1122,10 +1127,32 @@ class TestAutoLogin:
         assert _auto_import_allowed() is False
 
     def test_predicate_remote_bind_skipped(self, monkeypatch):
-        # is_interactive=True so the ONLY thing keeping the predicate False is the
-        # remote-bind gate. If that gate were deleted the predicate would reach
-        # the interactive branch and return True, failing this test on any host
-        # (catching the regression even on a non-GUI CI host).
+        # Default (flag=None) on a non-loopback streamable-http bind -> OFF.
+        # is_interactive=True is now irrelevant to the gate; the only thing
+        # keeping the predicate False is the remote-bind gate. If that gate were
+        # deleted the predicate would return True on any host, catching the
+        # regression even on a non-GUI CI host. Paired with
+        # test_predicate_explicit_true_remote_bind_still_skipped this pins that
+        # the remote-bind gate fires for BOTH the auto (None) and force-on (True)
+        # resolutions.
+        config = _auto_import_config(
+            flag=None,
+            transport="streamable-http",
+            host="0.0.0.0",
+            is_interactive=True,
+        )
+        monkeypatch.setattr("linkedin_mcp_server.bootstrap.get_config", lambda: config)
+        monkeypatch.setattr(
+            "linkedin_mcp_server.bootstrap.get_runtime_policy",
+            lambda: RuntimePolicy.MANAGED,
+        )
+        assert _auto_import_allowed() is False
+
+    def test_predicate_explicit_true_remote_bind_still_skipped(self, monkeypatch):
+        # Force-on must NOT override the network-bind gate: flag True +
+        # non-loopback streamable-http host -> still OFF. The Docker and
+        # remote-bind gates sit BEFORE the final return True, so an explicit
+        # opt-in cannot reach a network-exposed cookie read.
         config = _auto_import_config(
             flag=True,
             transport="streamable-http",
@@ -1163,41 +1190,29 @@ class TestAutoLogin:
         )
         assert _auto_import_allowed() is True
 
-    def test_predicate_auto_non_tty_with_gui_off(self, monkeypatch):
+    def test_predicate_auto_non_tty_default_on(self, monkeypatch):
+        # Default-on headline case: flag None (auto), non-interactive stdio
+        # Desktop child -> ON. No TTY or GUI signal gates it any more.
         config = _auto_import_config(flag=None, is_interactive=False)
         monkeypatch.setattr("linkedin_mcp_server.bootstrap.get_config", lambda: config)
         monkeypatch.setattr(
             "linkedin_mcp_server.bootstrap.get_runtime_policy",
             lambda: RuntimePolicy.MANAGED,
         )
-        monkeypatch.setattr(
-            "linkedin_mcp_server.bootstrap.has_local_gui_session", lambda: True
-        )
-        assert _auto_import_allowed() is False
-
-    def test_predicate_explicit_opt_in_non_tty_with_gui(self, monkeypatch):
-        config = _auto_import_config(flag=True, is_interactive=False)
-        monkeypatch.setattr("linkedin_mcp_server.bootstrap.get_config", lambda: config)
-        monkeypatch.setattr(
-            "linkedin_mcp_server.bootstrap.get_runtime_policy",
-            lambda: RuntimePolicy.MANAGED,
-        )
-        monkeypatch.setattr(
-            "linkedin_mcp_server.bootstrap.has_local_gui_session", lambda: True
-        )
         assert _auto_import_allowed() is True
 
-    def test_predicate_explicit_opt_in_non_tty_no_gui(self, monkeypatch):
+    def test_predicate_explicit_opt_in_non_tty(self, monkeypatch):
+        # flag True, non-interactive -> ON regardless of platform/GUI. Together
+        # with test_predicate_auto_non_tty_default_on and
+        # test_predicate_auto_interactive_allowed this pins that neither `flag`
+        # (None vs True) nor `is_interactive` changes the answer any more.
         config = _auto_import_config(flag=True, is_interactive=False)
         monkeypatch.setattr("linkedin_mcp_server.bootstrap.get_config", lambda: config)
         monkeypatch.setattr(
             "linkedin_mcp_server.bootstrap.get_runtime_policy",
             lambda: RuntimePolicy.MANAGED,
         )
-        monkeypatch.setattr(
-            "linkedin_mcp_server.bootstrap.has_local_gui_session", lambda: False
-        )
-        assert _auto_import_allowed() is False
+        assert _auto_import_allowed() is True
 
     async def test_relogin_resets_import_latch(self, isolate_profile_dir, monkeypatch):
         """A relogin force-move resets the one-shot import latch for the next episode."""
@@ -1323,3 +1338,61 @@ class TestAutoLogin:
         login_task = get_bootstrap_state().login_task
         if login_task is not None:
             login_task.cancel()
+
+    async def test_no_session_logs_fallback_reason(
+        self, isolate_profile_dir, monkeypatch, _stub_import_env, caplog
+    ):
+        """A decrypted-but-rejected session logs why it fell back, not silently."""
+        never_done = asyncio.Event()
+
+        async def fake_login_flow() -> None:
+            await never_done.wait()
+
+        monkeypatch.setattr(
+            "linkedin_mcp_server.bootstrap._run_login_flow", fake_login_flow
+        )
+        monkeypatch.setattr(_IMPORT_TARGET, AsyncMock(return_value=False))
+        _patch_inline_wait(monkeypatch, 0.05, auto_import=True)
+
+        initialize_bootstrap("managed")
+
+        try:
+            with caplog.at_level(logging.INFO, logger="linkedin_mcp_server.bootstrap"):
+                with pytest.raises(AuthenticationInProgressError):
+                    await ensure_tool_ready_or_raise("get_person_profile")
+            assert "found no usable browser session" in caplog.text
+        finally:
+            never_done.set()
+            login_task = get_bootstrap_state().login_task
+            if login_task is not None:
+                login_task.cancel()
+
+    async def test_import_timeout_degrades_to_manual_login(
+        self, isolate_profile_dir, monkeypatch, _stub_import_env, caplog
+    ):
+        """A wedged import times out, logs it, and falls back instead of hanging."""
+        never_done = asyncio.Event()
+
+        async def fake_login_flow() -> None:
+            await never_done.wait()
+
+        monkeypatch.setattr(
+            "linkedin_mcp_server.bootstrap._run_login_flow", fake_login_flow
+        )
+        # Exercise the except TimeoutError branch deterministically: no real wait.
+        monkeypatch.setattr(_IMPORT_TARGET, AsyncMock(side_effect=TimeoutError()))
+        _patch_inline_wait(monkeypatch, 0.05, auto_import=True)
+
+        initialize_bootstrap("managed")
+
+        try:
+            with caplog.at_level(logging.INFO, logger="linkedin_mcp_server.bootstrap"):
+                with pytest.raises(AuthenticationInProgressError):
+                    await ensure_tool_ready_or_raise("get_person_profile")
+            assert "Auto-import timed out" in caplog.text
+            assert get_bootstrap_state().login_task is not None
+        finally:
+            never_done.set()
+            login_task = get_bootstrap_state().login_task
+            if login_task is not None:
+                login_task.cancel()

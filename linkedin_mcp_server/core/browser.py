@@ -1,5 +1,6 @@
 """Browser lifecycle management using Patchright with persistent context."""
 
+import asyncio
 import json
 import logging
 import os
@@ -25,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_USER_DATA_DIR = Path.home() / ".linkedin-mcp" / "profile"
 _PRIVATE_FILE_MODE = 0o600
+_CLEANUP_TIMEOUT_SECONDS = 10
 
 
 class BrowserManager:
@@ -119,15 +121,34 @@ class BrowserManager:
         if context is None and playwright is None:
             return
 
+        # Bound each cleanup step. A wedged Chromium (stale SingletonLock,
+        # sandbox stall, X-less host) can hang context.close() / playwright.stop()
+        # indefinitely; without these timeouts a caller that cancels close()
+        # (e.g. asyncio.wait_for on the auto-import) would block past its own
+        # budget while awaiting the hung cleanup.
         if context is not None:
             try:
-                await context.close()
+                await asyncio.wait_for(
+                    context.close(), timeout=_CLEANUP_TIMEOUT_SECONDS
+                )
+            except TimeoutError:
+                logger.error(
+                    "Timed out closing browser context after %ss",
+                    _CLEANUP_TIMEOUT_SECONDS,
+                )
             except Exception as exc:
                 logger.error("Error closing browser context: %s", exc)
 
         if playwright is not None:
             try:
-                await playwright.stop()
+                await asyncio.wait_for(
+                    playwright.stop(), timeout=_CLEANUP_TIMEOUT_SECONDS
+                )
+            except TimeoutError:
+                logger.error(
+                    "Timed out stopping playwright after %ss",
+                    _CLEANUP_TIMEOUT_SECONDS,
+                )
             except Exception as exc:
                 logger.error("Error stopping playwright: %s", exc)
 

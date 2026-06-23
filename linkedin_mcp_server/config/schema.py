@@ -43,10 +43,15 @@ class BrowserConfig:
     # Bounded inline wait before the pending signal; 0 = immediate return
     login_inline_wait_seconds: float = DEFAULT_LOGIN_INLINE_WAIT_SECONDS
     # Auto-import a LinkedIn session from a locally logged-in browser on the
-    # first no-session tool call, before falling back to manual login. None =
-    # "auto": on for an interactive TTY run (a human can answer a keychain
-    # dialog), off for a non-TTY context (stdio Desktop child) unless explicitly
-    # enabled. True/False force it on/off regardless of context.
+    # first no-session tool call, before falling back to manual login. On by
+    # default: None ("auto") and True both enable it across interactive and
+    # non-interactive desktop runs on every platform. False disables it. No
+    # effect under Docker (no host browser/keychain) or on a non-loopback HTTP
+    # bind (a network-exposed server must not read the host browser cookie).
+    # Note the non-loopback gate covers network-exposed HTTP only, not
+    # stdio-over-SSH: a non-console session simply fails to read the local
+    # user's keychain and degrades to manual login, and no cookie crosses the
+    # network.
     auto_import_from_browser: bool | None = None
 
     def validate(self) -> None:
