@@ -19,7 +19,13 @@ from fastmcp import Context
 
 from linkedin_mcp_server.authentication import get_authentication_source
 from linkedin_mcp_server.common_utils import secure_mkdir, secure_write_text, utcnow_iso
-from linkedin_mcp_server.drivers.browser import get_profile_dir
+from linkedin_mcp_server.config import get_config
+from linkedin_mcp_server.drivers.browser import (
+    close_browser,
+    current_headless,
+    get_profile_dir,
+    set_headless,
+)
 from linkedin_mcp_server.exceptions import (
     AuthenticationBootstrapFailedError,
     AuthenticationInProgressError,
@@ -88,6 +94,8 @@ class BootstrapState:
     auth_completed_at: str | None = None
     setup_task: asyncio.Task[None] | None = None
     login_task: asyncio.Task[None] | None = None
+    import_task: asyncio.Task[bool] | None = None
+    import_attempted: bool = False
     initialized: bool = False
 
 
@@ -97,12 +105,13 @@ _lock = asyncio.Lock()
 
 def reset_bootstrap_for_testing() -> None:
     """Reset bootstrap singleton state for test isolation."""
-    global _state, _lock
-    for task in (_state.setup_task, _state.login_task):
+    global _state, _lock, _AUTO_IMPORT_ANNOUNCED
+    for task in (_state.setup_task, _state.login_task, _state.import_task):
         if task is not None and not task.done():
             task.cancel()
     _state = BootstrapState()
     _lock = asyncio.Lock()
+    _AUTO_IMPORT_ANNOUNCED = False
     os.environ.pop("PLAYWRIGHT_BROWSERS_PATH", None)
     # Tolerate monkeypatched stand-ins that lack `cache_clear`.
     clear = getattr(_patchright_install_targets, "cache_clear", None)
@@ -443,7 +452,158 @@ def _has_source_state() -> bool:
     return True
 
 
+def _auto_import_allowed() -> bool:
+    """Return whether a silent browser-session import is safe to attempt now.
+
+    Auto-import is ON BY DEFAULT. Locale-independent: keys off the config flag,
+    the runtime policy, and the transport bind address -- never any displayed
+    UI string. The flag check MUST stay first (test fakes and the tri-state
+    'auto' resolution depend on it): None (default) and True both enable it,
+    only an explicit False disables it.
+
+    The two hard limits stay: Docker (no host browser/keychain) and a
+    non-loopback streamable-http bind (a network-exposed HTTP daemon must not
+    harvest a host cookie on a remote request). Note this covers network-exposed
+    HTTP only, NOT stdio-over-SSH: a non-console session simply fails to decrypt
+    the local user's keychain and degrades to manual login, and no cookie
+    crosses the network.
+    """
+    config = get_config()
+    if config.browser.auto_import_from_browser is False:
+        return False
+    if get_runtime_policy() == RuntimePolicy.DOCKER:
+        # No host browser and no keychain inside a container.
+        return False
+    # A network-exposed HTTP daemon must never silently harvest a cookie on a
+    # request from a remote client. Gate on the BIND ADDRESS, not the transport
+    # type: a streamable-http server on a loopback host is the documented local
+    # dev / verify flow and IS a desktop case; only a non-loopback bind is the
+    # service case. This is an exact-match loopback allowlist that fails closed:
+    # any unrecognized host (0.0.0.0, ::, a LAN IP, an IPv4-mapped loopback)
+    # is treated as non-loopback and gated OFF.
+    if config.server.transport == "streamable-http" and config.server.host not in (
+        "127.0.0.1",
+        "::1",
+        "localhost",
+    ):
+        return False
+    return True
+
+
+def _pending_login_message(prior_error: str | None) -> str:
+    """Poll-friendly wording for a still-pending login (not a failure)."""
+    base = (
+        "A LinkedIn login window is open and login is still in progress. "
+        "This is not a failure. Complete the sign-in in the browser, then "
+        "call this exact tool again in about 30 seconds to resume."
+    )
+    if prior_error:
+        return f"{base} The previous login attempt did not finish: {prior_error}"
+    return base
+
+
+_AUTO_IMPORT_ANNOUNCED = False
+
+
+async def _announce_auto_import_once(ctx: Context | None) -> None:
+    """Emit a single notice per process before the first auto-import.
+
+    Routes through the MCP ``ctx`` when available so a Claude Desktop user (who
+    never sees stdio server logs) is told why a keychain dialog may appear; also
+    logs once for the server operator's record.
+    """
+    global _AUTO_IMPORT_ANNOUNCED
+    if _AUTO_IMPORT_ANNOUNCED:
+        return
+    _AUTO_IMPORT_ANNOUNCED = True
+    message = (
+        "No LinkedIn session found; importing one from a locally logged-in "
+        "browser. macOS may show a one-time keychain prompt. Set "
+        "AUTO_IMPORT_FROM_BROWSER=false or pass --no-auto-import to disable."
+    )
+    logger.info(message)
+    if ctx is not None:
+        try:
+            await ctx.info(message)
+        except Exception:  # noqa: BLE001 - a notice failure must not block import
+            logger.debug("ctx.info notice failed", exc_info=True)
+
+
+async def _try_auto_import_session(ctx: Context | None = None) -> bool:
+    """Attempt a one-shot browser-session import outside ``_lock``.
+
+    Returns True only when a validated session was persisted (so ``_auth_ready()``
+    is now True). Every expected "nothing to import" outcome -- no live session,
+    app-bound-only cookies, keystore denial/timeout, or LinkedIn rejecting the
+    cookies -- returns False so the caller falls through to manual login. Only an
+    unexpected error propagates.
+
+    NOTE: the import is a LAZY import (not a top-level one) on purpose -- the
+    test suite patches
+    ``linkedin_mcp_server.browser_import.orchestrate.import_session_from_browser``
+    and relies on it being re-looked-up at call time. Do not hoist it.
+    """
+    from linkedin_mcp_server.browser_import.orchestrate import (
+        import_session_from_browser,
+    )
+    from linkedin_mcp_server.core.exceptions import AuthenticationError, NetworkError
+    from linkedin_mcp_server.exceptions import (
+        CookieDecryptionError,
+        LinkedInMCPError,
+        NoLinkedInSessionFoundError,
+    )
+
+    await _announce_auto_import_once(ctx)
+    user_data_dir = get_profile_dir()
+    # The import opens a persistent context on user_data_dir; the singleton holds
+    # a SingletonLock on that same dir, so release it first. No-op on the
+    # no-session path (_browser is None); defensive on any relogin reuse.
+    await close_browser()
+    prev_headless = current_headless()
+    set_headless(True)  # background probe; never pop a visible window
+    try:
+        # Hard ceiling on the whole import. The on-loop validation step launches
+        # a persistent Chromium context (drivers/browser.py validate_imported_cookies
+        # -> core/browser.py start) with NO launch timeout, so a wedged binary
+        # (stale SingletonLock, sandbox stall, half-installed Chromium, X-less
+        # Linux desktop) would otherwise hang the first no-session tool call.
+        # Default-on routes every desktop first-call through this, so the bound
+        # is what makes "fails fast and falls back" hold end to end. Keychain
+        # reads are already bounded (security 10s / secret-tool 10s); this covers
+        # the launch + navigation budget on top.
+        result = await asyncio.wait_for(
+            import_session_from_browser(None, user_data_dir=user_data_dir),
+            timeout=60,
+        )
+        if not result:
+            # Reached only when a live li_at decrypted but LinkedIn rejected the
+            # session (orchestrate.py:254). The "no live session" and "could not
+            # decrypt" cases RAISE and are handled below.
+            logger.info(
+                "Auto-import found no usable browser session; "
+                "falling back to manual login"
+            )
+        return result
+    except TimeoutError:
+        logger.info("Auto-import timed out after 60s; falling back to manual login")
+        return False
+    except (
+        NoLinkedInSessionFoundError,
+        CookieDecryptionError,
+        AuthenticationError,
+        NetworkError,
+        LinkedInMCPError,
+    ) as exc:
+        logger.info("Auto-import unavailable; falling back to manual login: %s", exc)
+        return False
+    finally:
+        set_headless(prev_headless)
+
+
 async def _start_login_if_needed(ctx: Context | None = None) -> None:
+    # Cheap check-and-claim under the lock; the slow work (auto-import browser
+    # launch, then the bounded inline wait) runs AFTER the lock is released so
+    # concurrent pollers never serialize on it.
     async with _lock:
         await _refresh_background_task_state()
 
@@ -451,35 +611,98 @@ async def _start_login_if_needed(ctx: Context | None = None) -> None:
             _state.auth_state = AuthState.READY
             return
 
+        login_task: asyncio.Task[None] | None = None
+        import_task: asyncio.Task[bool] | None = None
+        prior_error: str | None = None
+
         if _state.login_task is not None and not _state.login_task.done():
-            if ctx is not None:
-                await ctx.report_progress(
-                    progress=25,
-                    total=100,
-                    message="LinkedIn login already in progress",
-                )
-            raise AuthenticationInProgressError(
-                "No valid LinkedIn session is available yet. LinkedIn login is already in progress in a browser window. Complete login there, then retry this tool."
+            # A manual login is already running: await the SAME task. Never
+            # start an import on top of an in-flight headed login.
+            login_task = _state.login_task
+        elif _state.import_task is not None and not _state.import_task.done():
+            # Another poller's import is in flight: await IT, do NOT spawn a
+            # headed login (both would open a persistent context on the same
+            # user_data_dir and collide on Chromium's SingletonLock).
+            import_task = _state.import_task
+        elif not _state.import_attempted and _auto_import_allowed():
+            # Claim the one-shot import under the lock so only one keychain read
+            # / import browser ever runs per process episode.
+            _state.import_attempted = True
+            _state.import_task = asyncio.create_task(
+                _try_auto_import_session(ctx), name="linkedin-auto-import"
             )
+            import_task = _state.import_task
+        else:
+            prior_error = _state.last_error
 
-        _move_invalid_auth_state_aside()
-        _state.auth_state = AuthState.STARTING
-        _state.auth_started_at = utcnow_iso()
-        _state.last_error = None
-        _state.auth_completed_at = None
-        _state.login_task = asyncio.create_task(
-            _run_login_flow(), name="linkedin-login"
-        )
+    # ---- lock released ----
 
+    # Await an import (ours or a peer's). On success the caller falls through to
+    # the scrape; on failure we re-enter to take the manual-login path.
+    if import_task is not None:
+        try:
+            await import_task
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - any import failure -> manual login
+            logger.debug("Auto-import task failed", exc_info=True)
+        async with _lock:
+            await _refresh_background_task_state()
+            if _auth_ready():
+                _state.auth_state = AuthState.READY
+                return
+        # Import resolved without a session -> manual-login path. Re-enter:
+        # import_attempted is now True and import_task is done, so this call
+        # takes the spawn/await-login branch (no recursion loop risk).
+        return await _start_login_if_needed(ctx)
+
+    # No import in flight and none claimed -> the #535 manual-login + inline-wait
+    # fallback. Spawn the login task if one is not already shared.
+    if login_task is None:
+        async with _lock:
+            await _refresh_background_task_state()
+            if _auth_ready():
+                _state.auth_state = AuthState.READY
+                return
+            if _state.login_task is not None and not _state.login_task.done():
+                login_task = _state.login_task
+                prior_error = None
+            else:
+                prior_error = _state.last_error
+                _move_invalid_auth_state_aside()
+                _state.auth_state = AuthState.STARTING
+                _state.auth_started_at = utcnow_iso()
+                _state.last_error = None
+                _state.auth_completed_at = None
+                _state.login_task = asyncio.create_task(
+                    _run_login_flow(), name="linkedin-login"
+                )
+                login_task = _state.login_task
+
+    # ---- #535 inline wait: unchanged logic ----
+    budget = get_config().browser.login_inline_wait_seconds
+    if budget and budget > 0:
+        # asyncio.wait (NOT wait_for) leaves the task RUNNING on timeout; a
+        # budget-elapsed wait must never cancel the in-progress login browser.
+        await asyncio.wait({login_task}, timeout=budget)
+        # Reconcile a finished task (nulls login_task, sets auth_state) before
+        # reading readiness; success is filesystem truth via _auth_ready().
+        await _refresh_background_task_state()
+        if _auth_ready():
+            _state.auth_state = AuthState.READY
+            # Resume one-shot: the caller falls through to
+            # get_or_create_browser()/ensure_authenticated()/scrape.
+            return
+
+    # Budget elapsed (still running), budget == 0, or the task finished but did
+    # not persist a valid session. Emit the poll-friendly pending signal.
     if ctx is not None:
         await ctx.report_progress(
             progress=25,
             total=100,
-            message="LinkedIn login browser opened",
+            message="LinkedIn login in progress",
         )
-    raise AuthenticationStartedError(
-        "No valid LinkedIn session was found. A login browser window has been opened. Sign in with your LinkedIn credentials there, then retry this tool."
-    )
+    raise AuthenticationInProgressError(_pending_login_message(prior_error))
 
 
 async def start_login_if_needed(ctx: Context | None = None) -> None:
@@ -521,6 +744,12 @@ async def invalidate_auth_and_trigger_relogin(
 
         # Force-move stale profile files (skip _auth_ready() guard).
         _force_move_auth_state_aside()
+
+        # A force-move starts a fresh no-session episode; allow auto-import to
+        # be re-attempted on the next tool call (the prior latch was for the
+        # previous episode only). Auto-import fires at most once per episode.
+        _state.import_attempted = False
+        _state.import_task = None
 
         # Start fresh login.
         _state.auth_state = AuthState.STARTING

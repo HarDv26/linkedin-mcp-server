@@ -10,7 +10,7 @@ import logging
 import os
 from pathlib import Path
 
-from linkedin_mcp_server.common_utils import secure_mkdir
+from linkedin_mcp_server.common_utils import harden_linkedin_tree, secure_mkdir
 from linkedin_mcp_server.core import (
     AuthenticationError,
     BrowserManager,
@@ -19,6 +19,7 @@ from linkedin_mcp_server.core import (
     is_logged_in,
     resolve_remember_me_prompt,
 )
+
 
 from linkedin_mcp_server.common_utils import utcnow_iso
 from linkedin_mcp_server.config import get_config
@@ -230,6 +231,41 @@ async def _authenticate_existing_profile(
     except Exception:
         await browser.close()
         raise
+
+
+async def validate_imported_cookies(cookie_path: Path, profile_dir: Path) -> bool:
+    """Validate freshly imported cookies against /feed/ before persisting.
+
+    Starts a headless browser on *profile_dir*, injects the LinkedIn cookies
+    from *cookie_path*, and proves /feed/ with the same validator login and the
+    Docker bridge use (``_feed_auth_succeeds``: remember-me resolution plus
+    auth-barrier detection). Used only by the browser-import CLI path.
+
+    A local :class:`BrowserManager` is used (never the singleton), so
+    ``close_browser()``'s export-on-close is not involved and cannot shrink
+    ``cookies.json``. Injection routes through the existing ``import_cookies``
+    with ``preset_name="bridge_core"`` (the largest existing preset); the
+    on-disk ``cookies.json`` still holds the full superset for the Docker
+    bridge. Always closes the browser in ``finally``.
+    """
+    launch_options, viewport = _launch_options()
+    secure_mkdir(profile_dir)
+    harden_linkedin_tree(profile_dir)
+    browser = _make_browser(
+        profile_dir, launch_options=launch_options, viewport=viewport
+    )
+    try:
+        await browser.start()
+        await browser.page.goto(
+            "https://www.linkedin.com/feed/", wait_until="domcontentloaded"
+        )
+        await stabilize_navigation("import pre-validate feed navigation", logger)
+        if not await browser.import_cookies(cookie_path, preset_name="bridge_core"):
+            return False
+        await stabilize_navigation("import cookie injection", logger)
+        return await _feed_auth_succeeds(browser)
+    finally:
+        await browser.close()
 
 
 async def _bridge_runtime_profile(
@@ -520,6 +556,11 @@ def set_headless(headless: bool) -> None:
     """Set headless mode for future browser creation."""
     global _headless
     _headless = headless
+
+
+def current_headless() -> bool:
+    """Return the headless mode future browser creation will use."""
+    return _headless
 
 
 async def validate_session() -> bool:

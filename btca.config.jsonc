@@ -78,6 +78,13 @@
       "name": "patchright",
       "url": "https://github.com/Kaliiiiiiiiii-Vinyzu/patchright-python",
       "branch": "main"
+    },
+    {
+      "type": "git",
+      "name": "pythonCryptography",
+      "url": "https://github.com/pyca/cryptography",
+      "branch": "main",
+      "specialNotes": "PyCA cryptography. AES-CBC/GCM + PBKDF2 for Chromium cookie decryption (browser session import, #534)."
     }
   ]
 }
