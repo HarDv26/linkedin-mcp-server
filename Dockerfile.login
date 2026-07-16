@@ -1,4 +1,4 @@
-FROM hardv26/linkedin-mcp-server:safe-4.17.0
+FROM hardv26/linkedin-mcp-server:safe-4.17.1
 
 USER root
 RUN apt-get update \

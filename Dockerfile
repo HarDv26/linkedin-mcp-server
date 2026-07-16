@@ -25,7 +25,11 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/patchright
 RUN patchright install-deps chromium && \
     patchright install chromium && \
     chmod -R 755 /opt/patchright && \
+    CHROME_BIN="$(python -c "from pathlib import Path; print(next(Path('/opt/patchright').glob('chromium-*/chrome-linux64/chrome')))" )" && \
+    ln -s "$CHROME_BIN" /usr/local/bin/patchright-chromium && \
     rm -rf /var/lib/apt/lists/*
+
+ENV CHROME_PATH=/usr/local/bin/patchright-chromium
 
 USER pwuser
 

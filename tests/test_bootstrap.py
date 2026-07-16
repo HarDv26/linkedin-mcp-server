@@ -646,6 +646,27 @@ class TestChromePathShortCircuit:
         assert state.setup_state is SetupState.READY
         assert state.setup_task is None
 
+    @pytest.mark.parametrize("full", [True, False])
+    def test_cli_install_gate_skips_managed_install_for_custom_chrome(
+        self, isolate_profile_dir, monkeypatch, full
+    ):
+        config = self._config(headless=not full, chrome_path="/usr/bin/chromium")
+        monkeypatch.setattr("linkedin_mcp_server.bootstrap.get_config", lambda: config)
+
+        async def fail_install(*args, **kwargs):
+            raise AssertionError("managed Patchright install must not run")
+
+        monkeypatch.setattr(
+            "linkedin_mcp_server.bootstrap._ensure_full_chromium_installed",
+            fail_install,
+        )
+        monkeypatch.setattr(
+            "linkedin_mcp_server.bootstrap._run_install_shell_only",
+            fail_install,
+        )
+
+        assert ensure_browser_installed(full=full) is None
+
 
 class TestTwoStageInstall:
     """_run_browser_setup runs --only-shell then --no-shell and writes v3 metadata."""
@@ -790,6 +811,9 @@ class TestEnsureBrowserInstalledTarget:
     def _stub(self, monkeypatch):
         shell_calls = {"value": 0}
         full_calls = {"value": 0}
+        monkeypatch.setattr(
+            "linkedin_mcp_server.bootstrap._uses_custom_chrome", lambda: False
+        )
 
         async def fake_shell() -> None:
             shell_calls["value"] += 1

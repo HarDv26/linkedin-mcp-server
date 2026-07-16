@@ -478,6 +478,8 @@ def ensure_browser_installed(*, full: bool = False) -> None:
     async background setup instead (non-blocking).
     """
     configure_browser_environment()
+    if _uses_custom_chrome():
+        return
     if full:
         if full_chromium_ready():
             return
