@@ -9,6 +9,8 @@
 
 > **Disclaimer:** This is an independent, community project. It is not affiliated with, authorized by, endorsed by, or sponsored by LinkedIn Corporation or Microsoft. "LinkedIn" is a registered trademark of LinkedIn Corporation and is used here only descriptively to identify the third-party service this software interoperates with.
 
+> **Hermes fork safety:** This fork disables connection requests and message sending by default. See [HERMES_SAFETY.md](HERMES_SAFETY.md) for the review-first operating policy, capability limits and LinkedIn account-risk assessment.
+
 An MCP server that lets AI assistants like Claude read LinkedIn data through your own logged-in browser session. Access profiles and companies, search for jobs, or get job details.
 
 ## Sponsor

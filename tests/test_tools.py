@@ -1156,7 +1156,7 @@ class TestToolTimeouts:
         from linkedin_mcp_server.server import create_mcp_server
 
         custom_timeout = 7.5
-        mcp = create_mcp_server(tool_timeout=custom_timeout)
+        mcp = create_mcp_server(tool_timeout=custom_timeout, allow_write_actions=True)
 
         tool_names = (
             "get_person_profile",
@@ -1184,7 +1184,7 @@ class TestToolTimeouts:
         from linkedin_mcp_server.config.schema import DEFAULT_TOOL_TIMEOUT_SECONDS
         from linkedin_mcp_server.server import create_mcp_server
 
-        mcp = create_mcp_server()
+        mcp = create_mcp_server(allow_write_actions=True)
 
         tool_names = (
             "get_person_profile",

@@ -49,8 +49,16 @@ async def browser_lifespan(app: FastMCP) -> AsyncIterator[dict[str, Any]]:
     await close_browser()
 
 
-def create_mcp_server(*, tool_timeout: float = DEFAULT_TOOL_TIMEOUT_SECONDS) -> FastMCP:
-    """Create and configure the MCP server with all LinkedIn tools."""
+def create_mcp_server(
+    *,
+    tool_timeout: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
+    allow_write_actions: bool = False,
+) -> FastMCP:
+    """Create and configure the MCP server.
+
+    Write actions are disabled by default for account safety. Callers must
+    explicitly opt in before connection requests or messages are exposed.
+    """
     mcp = FastMCP(
         "mcp-server-linkedin",
         version=__version__,
@@ -66,6 +74,13 @@ def create_mcp_server(*, tool_timeout: float = DEFAULT_TOOL_TIMEOUT_SECONDS) -> 
     register_job_tools(mcp, tool_timeout=tool_timeout)
     register_messaging_tools(mcp, tool_timeout=tool_timeout)
     register_feed_tools(mcp, tool_timeout=tool_timeout)
+
+    if not allow_write_actions:
+        mcp.local_provider.remove_tool("connect_with_person")
+        mcp.local_provider.remove_tool("send_message")
+        logger.info(
+            "Safe mode enabled: connection requests and messages are not exposed"
+        )
 
     # Register session management tool
     @mcp.tool(

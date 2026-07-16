@@ -97,3 +97,19 @@ class TestServerVersion:
         mcp = create_mcp_server()
 
         assert mcp.version == __version__
+
+
+class TestSafeMode:
+    async def test_safe_mode_is_default_and_omits_write_actions(self):
+        mcp = create_mcp_server()
+
+        assert await mcp.get_tool("connect_with_person") is None
+        assert await mcp.get_tool("send_message") is None
+        assert await mcp.get_tool("search_jobs") is not None
+        assert await mcp.get_tool("get_my_profile") is not None
+
+    async def test_write_actions_require_explicit_opt_in(self):
+        mcp = create_mcp_server(allow_write_actions=True)
+
+        assert await mcp.get_tool("connect_with_person") is not None
+        assert await mcp.get_tool("send_message") is not None
