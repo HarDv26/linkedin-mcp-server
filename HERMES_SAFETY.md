@@ -30,6 +30,24 @@ It **cannot** currently:
 
 The `easy_apply` option only filters job-search results; it does not submit an application.
 
+## One-time login on a headless Hermes host
+
+The optional `Dockerfile.login` image runs a temporary noVNC login window. It is designed to be published **only on host loopback** and reached through SSH tunnelling.
+
+Current private tunnel command for this host:
+
+```bash
+ssh -N -L 7900:127.0.0.1:7900 root@192.168.40.16
+```
+
+Then open:
+
+```text
+http://127.0.0.1:7900/vnc.html?autoconnect=1&resize=scale
+```
+
+The user must type their own LinkedIn credentials and complete MFA/CAPTCHA. Hermes must never type, receive or store the password outside the isolated browser profile. The temporary login container exits after successful authentication; the browser session remains in `~/.linkedin-mcp-safe/profile/` for the safe read-oriented MCP container.
+
 ## Operating policy
 
 1. Use LinkedIn MCP only for low-volume, user-directed reading and job discovery.
